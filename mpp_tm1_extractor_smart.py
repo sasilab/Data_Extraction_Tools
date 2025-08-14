@@ -1,83 +1,64 @@
 #!/usr/bin/env python3
 """
-Smart MPP tm_1 extractor
+Smart MPP tm_1 extractor (robust)
 
-1) Index archives in --base-dir by reading XML <info>:
-     <item key="startdate" value="YYYY-MM-DD HH:MM:SS"/>
-     <item key="enddate"   value="YYYY-MM-DD HH:MM:SS"/>
-2) For each requested timestamp from a CSV (e.g., sma_all_files_extended.csv),
-   find the archive whose [startdate, enddate] contains it.
-3) Parse only those archives, extract rows where:
-     - item key="timestamp" == requested timestamp
-     - item key="inverter_id" == <inverter-id>  (default: "4")
-     - then read item key="tm_1"
+Improvements vs previous version:
+- Accepts a *file* path in --base-dir (treats it as a single archive to parse).
+- Verbose logging (use --debug).
+- Indexing fallback: if <info> block is missing, derive [start,end] by scanning <row> timestamps.
+- Better diagnostics: lists which archives were indexed and their ranges.
+
+What it does:
+1) Build an index of archives (zip/xml.gz/xml) under --base-dir (or handle a single file).
+   Index uses <info> startdate/enddate, or falls back to min/max <row> timestamps.
+2) Map requested timestamps (from your CSV) to the right archive by that time range.
+3) Open only the necessary archives and extract rows where:
+   - key="timestamp" == requested timestamp
+   - key="inverter_id" == <inverter-id> (default 4)
+   - read key="tm_1"
 4) Write CSV + Pickle with columns: timestamp, tm_1
-
-Supports .zip (first .xml inside), .xml.gz, and raw .xml.
-
-Usage:
-  python mpp_tm1_extractor_smart.py \
-    --base-dir /path/to/mpp \
-    --timestamps-csv /path/to/sma_all_files_extended.csv \
-    --ts-column timestamp \
-    --out-csv /path/to/out_tm1.csv \
-    --out-pkl /path/to/out_tm1.pkl \
-    [--inverter-id 4]
 """
 
 from pathlib import Path
 import sys, argparse, gzip, zipfile, io, re
 import xml.etree.ElementTree as ET
-from typing import Iterable, Dict, Set, Optional, List, Tuple
+from typing import Iterable, Dict, Set, Optional, List, Tuple, Union
 import pandas as pd
 from datetime import datetime
 
-# ---------- Helpers: timestamp parsing/normalization ----------
-
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
+def log(msg: str, debug: bool = False, force: bool = False):
+    if debug or force:
+        print(msg, file=sys.stderr)
+
+# ---------- Timestamp helpers ----------
+
 def parse_ts_any(s: str) -> datetime:
-    """
-    Accepts 'YYYY-MM-DD HH:MM:SS' or 'YYYYMMDDHHMMSS'.
-    Returns a datetime.
-    """
-    s = s.strip()
+    s = str(s).strip()
     if not s:
-        raise ValueError("Empty timestamp string")
-    # Remove quotes if present
-    if (s[0] == s[-1]) and s[0] in ("'", '"'):
+        raise ValueError("Empty timestamp")
+    if (s[0] == s[-1]) and s[0] in ('"', "'"):
         s = s[1:-1].strip()
-    # Try dash+space format first
     try:
         return datetime.strptime(s, TS_FMT)
     except Exception:
         pass
-    # Try compact 14-digit format
     if re.fullmatch(r"\d{14}", s):
         return datetime.strptime(s, "%Y%m%d%H%M%S")
-    # Try some CSV auto-parsed variants (e.g., pandas date)
-    # Let pandas parse if it's weird; then format back
-    try:
-        return pd.to_datetime(s).to_pydatetime()
-    except Exception as e:
-        raise ValueError(f"Unsupported timestamp format: {s}") from e
+    return pd.to_datetime(s).to_pydatetime()
 
 def ts_norm_str(dt: datetime) -> str:
-    """Normalized string for matching XML items."""
     return dt.strftime(TS_FMT)
 
 # ---------- File opening ----------
 
 def open_xml_stream(file_path: Path):
-    """
-    Returns a binary file-like object containing XML bytes ready for iterparse.
-    """
     name = file_path.name.lower()
     if name.endswith(".xml.gz"):
         return gzip.open(file_path, "rb")
     if name.endswith(".zip"):
         zf = zipfile.ZipFile(file_path, "r")
-        # choose the first .xml entry (you can tweak this to pick by name)
         xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
         if not xml_names:
             raise ValueError(f"No XML found inside zip: {file_path}")
@@ -87,17 +68,12 @@ def open_xml_stream(file_path: Path):
         return open(file_path, "rb")
     raise ValueError(f"Unsupported file type: {file_path}")
 
-# ---------- XML parsing (lightweight for <info>, streaming for <row>) ----------
+# ---------- XML parsing ----------
 
 def read_info_times(xml_stream) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Parse only until </info> to fetch startdate and enddate (strings).
-    Returns (startdate_str, enddate_str) as seen in XML, or (None, None).
-    """
     start_str = end_str = None
-    # We parse for 'end' events and stop after closing </info>
     context = ET.iterparse(xml_stream, events=("end",))
-    for event, elem in context:
+    for _, elem in context:
         if elem.tag == "item":
             k = (elem.attrib.get("key") or "").strip().lower()
             v = elem.attrib.get("value")
@@ -106,22 +82,21 @@ def read_info_times(xml_stream) -> Tuple[Optional[str], Optional[str]]:
             elif k == "enddate":
                 end_str = v
         elif elem.tag == "info":
-            # Done with info section
             elem.clear()
             break
         elem.clear()
     return start_str, end_str
 
 def iter_rows(xml_stream) -> Iterable[ET.Element]:
-    """Yield <row> elements from an XML stream efficiently."""
     context = ET.iterparse(xml_stream, events=("end",))
     for _, elem in context:
         if elem.tag == "row":
             yield elem
             elem.clear()
+        else:
+            elem.clear()
 
 def row_items_to_dict(row_elem: ET.Element) -> Dict[str, Optional[str]]:
-    """Convert <item key="..." value="..."/> to a dict with lowercase keys."""
     d: Dict[str, Optional[str]] = {}
     for item in row_elem.findall("item"):
         k = (item.attrib.get("key") or "").strip().lower()
@@ -129,38 +104,73 @@ def row_items_to_dict(row_elem: ET.Element) -> Dict[str, Optional[str]]:
         d[k] = v
     return d
 
-# ---------- Index archives by [startdate, enddate] ----------
+def derive_range_from_rows(fp: Path) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """If <info> is missing, scan rows to get min/max timestamp."""
+    ts_min = None
+    ts_max = None
+    with open_xml_stream(fp) as stream:
+        for row in iter_rows(stream):
+            d = row_items_to_dict(row)
+            ts = (d.get("timestamp") or "").strip()
+            if not ts:
+                continue
+            try:
+                dt = parse_ts_any(ts)
+            except Exception:
+                continue
+            ts_min = dt if ts_min is None else min(ts_min, dt)
+            ts_max = dt if ts_max is None else max(ts_max, dt)
+    return ts_min, ts_max
 
-def index_archives(base_dir: Path) -> List[Tuple[datetime, datetime, Path]]:
-    """
-    Returns a list of (start_dt, end_dt, path) for each archive discovered.
-    """
-    candidates = (
-        list(base_dir.rglob("*.zip")) +
-        list(base_dir.rglob("*.xml.gz")) +
-        list(base_dir.rglob("*.xml"))
+# ---------- Index archives ----------
+
+def discover_candidates(base: Path) -> List[Path]:
+    if base.is_file():
+        return [base]
+    # recursively
+    return (
+        list(base.rglob("*.zip")) +
+        list(base.rglob("*.xml.gz")) +
+        list(base.rglob("*.xml"))
     )
+
+def index_archives(base: Path, debug: bool = False) -> List[Tuple[datetime, datetime, Path]]:
+    candidates = discover_candidates(base)
+    if not candidates:
+        log(f"[WARN] No archives found under: {base}", debug=True, force=True)
+        return []
+
     idx: List[Tuple[datetime, datetime, Path]] = []
     for fp in sorted(candidates, key=lambda p: p.name.lower()):
         try:
+            # Try <info>
             with open_xml_stream(fp) as stream:
                 start_str, end_str = read_info_times(stream)
-            if not start_str or not end_str:
-                # If <info> not present, skip or fallback to name-based heuristic
-                # Here we skip to stay accurate
-                print(f"[WARN] No start/end in {fp.name}; skipping file for indexing.", file=sys.stderr)
+            if start_str and end_str:
+                start_dt = parse_ts_any(start_str)
+                end_dt = parse_ts_any(end_str)
+                idx.append((start_dt, end_dt, fp))
+                log(f"[INDEX] {fp.name} -> {ts_norm_str(start_dt)} .. {ts_norm_str(end_dt)}", debug)
                 continue
-            start_dt = parse_ts_any(start_str)
-            end_dt = parse_ts_any(end_str)
-            idx.append((start_dt, end_dt, fp))
+
+            # Fallback: derive by scanning row timestamps
+            log(f"[WARN] No <info> in {fp.name}; deriving range from rows...", debug=True, force=True)
+            ts_min, ts_max = derive_range_from_rows(fp)
+            if ts_min and ts_max:
+                idx.append((ts_min, ts_max, fp))
+                log(f"[INDEX-FALLBACK] {fp.name} -> {ts_norm_str(ts_min)} .. {ts_norm_str(ts_max)}", debug)
+            else:
+                log(f"[WARN] Could not derive range from {fp.name}; skipping.", debug=True, force=True)
+
         except Exception as e:
-            print(f"[WARN] Indexing failed for {fp}: {e}", file=sys.stderr)
+            log(f"[WARN] Indexing failed for {fp.name}: {e}", debug=True, force=True)
+    if not idx:
+        log("[WARN] Index is empty after scanning. Check your --base-dir path and archives.", debug=True, force=True)
+    else:
+        log(f"[INFO] Indexed {len(idx)} archive(s).", debug=True, force=True)
     return idx
 
 def find_covering_file(ts_dt: datetime, index: List[Tuple[datetime, datetime, Path]]) -> Optional[Path]:
-    """
-    Find the first archive whose [start_dt, end_dt] includes ts_dt.
-    """
     for start_dt, end_dt, fp in index:
         if start_dt <= ts_dt <= end_dt:
             return fp
@@ -168,10 +178,7 @@ def find_covering_file(ts_dt: datetime, index: List[Tuple[datetime, datetime, Pa
 
 # ---------- Extraction ----------
 
-def extract_from_archive(fp: Path, wanted_ts: Set[str], inverter_id_value: str) -> Dict[str, Optional[str]]:
-    """
-    Parse <row> of archive `fp`, and return mapping timestamp->tm_1 for the subset in `wanted_ts`.
-    """
+def extract_from_archive(fp: Path, wanted_ts: Set[str], inverter_id_value: str, debug: bool=False) -> Dict[str, Optional[str]]:
     results: Dict[str, Optional[str]] = {}
     with open_xml_stream(fp) as stream:
         for row in iter_rows(stream):
@@ -181,23 +188,22 @@ def extract_from_archive(fp: Path, wanted_ts: Set[str], inverter_id_value: str) 
                 continue
             if (d.get("inverter_id") or "").strip() != inverter_id_value:
                 continue
-            results[ts] = d.get("tm_1")
-            # optional: early stop if found all for this file
-            if len(results) == len(wanted_ts):
-                # not entirely safe if duplicates; but good enough
-                pass
+            tm1 = d.get("tm_1")
+            results[ts] = tm1
+    if results:
+        log(f"[FOUND] {fp.name}: matched {len(results)} timestamp(s).", debug=True, force=True)
     return results
 
-# ---------- Main flow ----------
+# ---------- Main ----------
 
-def load_requested_timestamps(csv_path: Path, ts_column: Optional[str]) -> List[str]:
+def load_requested_timestamps(csv_path: Path, ts_column: Optional[str], debug: bool=False) -> List[str]:
     df = pd.read_csv(csv_path)
-    # Auto-detect column if not provided
     if not ts_column:
         candidates = [c for c in df.columns if "timestamp" in c.lower()]
         if not candidates:
             raise ValueError("Could not auto-detect a timestamp column. Use --ts-column.")
         ts_column = candidates[0]
+        log(f"[INFO] Auto-detected timestamp column: {ts_column}", debug=True, force=True)
     if ts_column not in df.columns:
         raise ValueError(f"Column '{ts_column}' not found in {csv_path.name}. Columns: {list(df.columns)}")
 
@@ -208,14 +214,13 @@ def load_requested_timestamps(csv_path: Path, ts_column: Optional[str]) -> List[
         try:
             ts_list.append(ts_norm_str(parse_ts_any(str(val))))
         except Exception:
-            # If a row has a bad timestamp, skip but warn
-            print(f"[WARN] Skipping unparseable timestamp value: {val}", file=sys.stderr)
+            log(f"[WARN] Skipping unparseable timestamp value: {val}", debug=True, force=True)
+    log(f"[INFO] Loaded {len(ts_list)} timestamp(s) from CSV.", debug=True, force=True)
     return ts_list
 
 def write_outputs(mapping: Dict[str, Optional[str]], out_csv: Path, out_pkl: Path):
     rows = [{"timestamp": k, "tm_1": mapping.get(k)} for k in sorted(mapping)]
     df = pd.DataFrame(rows)
-    # numeric conversion
     df["tm_1"] = pd.to_numeric(df["tm_1"], errors="coerce")
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     out_pkl.parent.mkdir(parents=True, exist_ok=True)
@@ -223,62 +228,55 @@ def write_outputs(mapping: Dict[str, Optional[str]], out_csv: Path, out_pkl: Pat
     df.to_pickle(out_pkl)
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Extract tm_1 at specified timestamps from MPP XML archives by first locating the right archive via <info startdate/enddate>.")
-    ap.add_argument("--base-dir", required=True, help="Path to the mpp folder containing .zip/.xml.gz/.xml (searched recursively).")
-    ap.add_argument("--timestamps-csv", required=True, help="Path to sma_all_files_extended.csv (or a CSV with a timestamp column).")
-    ap.add_argument("--ts-column", default=None, help="Name of the timestamp column in the CSV. If omitted, auto-detects a column containing 'timestamp'.")
+    ap = argparse.ArgumentParser(description="Extract tm_1 at specified timestamps from MPP XML archives with robust indexing.")
+    ap.add_argument("--base-dir", required=True, help="Path to the mpp folder (recursively scanned) OR a single archive file (.zip/.xml.gz/.xml).")
+    ap.add_argument("--timestamps-csv", required=True, help="Path to sma_all_files_extended.csv (or any CSV with timestamp column).")
+    ap.add_argument("--ts-column", default=None, help="Name of the timestamp column. If omitted, auto-detects a column containing 'timestamp'.")
     ap.add_argument("--out-csv", required=True, help="Output CSV path.")
     ap.add_argument("--out-pkl", required=True, help="Output Pickle path (pandas DataFrame).")
     ap.add_argument("--inverter-id", default="4", help="Inverter ID to match (default: 4).")
+    ap.add_argument("--debug", action="store_true", help="Verbose logging.")
     args = ap.parse_args(argv)
 
-    base_dir = Path(args.base_dir).expanduser().resolve()
+    base = Path(args.base_dir).expanduser().resolve()
     ts_csv = Path(args.timestamps_csv).expanduser().resolve()
     out_csv = Path(args.out_csv).expanduser().resolve()
     out_pkl = Path(args.out_pkl).expanduser().resolve()
     inverter_id_value = str(args.inverter_id).strip()
+    debug = args.debug
 
-    # 1) Load + normalize timestamps from CSV
-    ts_list = load_requested_timestamps(ts_csv, args.ts_column)
+    ts_list = load_requested_timestamps(ts_csv, args.ts_column, debug=debug)
     if not ts_list:
         print("No valid timestamps found in CSV.", file=sys.stderr)
         sys.exit(1)
 
-    # 2) Build archive index by [startdate, enddate]
-    index = index_archives(base_dir)
+    index = index_archives(base, debug=debug)
     if not index:
-        print("No archives with valid start/end times were indexed. Check your mpp folder.", file=sys.stderr)
+        print("No archives indexed. Check --base-dir path and that it contains .zip/.xml.gz/.xml.", file=sys.stderr)
         sys.exit(1)
 
-    # 3) Map timestamps to the correct archive
-    #    We'll group timestamps by archive to minimize parsing.
     per_file: Dict[Path, Set[str]] = {}
-    missing_routing: List[str] = []
-
+    missing_route: List[str] = []
     for ts_str in ts_list:
         ts_dt = parse_ts_any(ts_str)
         fp = find_covering_file(ts_dt, index)
         if fp is None:
-            # Could fallback to filename-based heuristic here if desired.
-            missing_routing.append(ts_str)
+            missing_route.append(ts_str)
             continue
         per_file.setdefault(fp, set()).add(ts_str)
 
-    if missing_routing:
-        print(f"[WARN] {len(missing_routing)} timestamps did not map to any archive via <info>. They will appear as missing in outputs.", file=sys.stderr)
+    if missing_route:
+        log(f"[WARN] {len(missing_route)} timestamp(s) did not map to any archive range. They will appear as missing.", debug=True, force=True)
 
-    # 4) Parse only needed archives and collect tm_1
-    results: Dict[str, Optional[str]] = {ts: None for ts in ts_list}  # default None for all
+    results: Dict[str, Optional[str]] = {ts: None for ts in ts_list}
     for fp, wanted_ts in per_file.items():
         try:
-            found = extract_from_archive(fp, wanted_ts, inverter_id_value=inverter_id_value)
+            found = extract_from_archive(fp, wanted_ts, inverter_id_value=inverter_id_value, debug=debug)
             results.update(found)
         except Exception as e:
-            print(f"[WARN] Failed extracting from {fp.name}: {e}", file=sys.stderr)
+            log(f"[WARN] Failed extracting from {fp.name}: {e}", debug=True, force=True)
 
-    # 5) Write outputs
     write_outputs(results, out_csv, out_pkl)
-
     total = len(results)
     missing_vals = sum(1 for v in results.values() if v in (None, ""))
     print(f"Done. {total} rows written. {missing_vals} missing tm_1 (or not found).")
